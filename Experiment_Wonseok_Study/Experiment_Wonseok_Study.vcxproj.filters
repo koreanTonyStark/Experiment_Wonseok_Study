@@ -14,4 +14,35 @@
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="abstracted_control_system.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="abstracted_ecu.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="abstracted_job.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="abstracted_task.cc">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="abstracted_control_system.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="abstracted_ecu.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="abstracted_job.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="abstracted_task.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>

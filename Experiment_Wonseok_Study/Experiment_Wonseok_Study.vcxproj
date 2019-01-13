@@ -139,6 +139,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="abstracted_control_system.cc" />
+    <ClCompile Include="abstracted_ecu.cc" />
+    <ClCompile Include="abstracted_job.cc" />
+    <ClCompile Include="abstracted_task.cc" />
+    <ClCompile Include="main.cc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="abstracted_control_system.h" />
+    <ClInclude Include="abstracted_ecu.h" />
+    <ClInclude Include="abstracted_job.h" />
+    <ClInclude Include="abstracted_task.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
