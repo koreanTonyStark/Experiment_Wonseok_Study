@@ -57,7 +57,7 @@ private:
 	std::uint64_t                           simulator_num_of_cores_;
 	std::vector<std::set<AbstractedJob*>>   simulator_ready_queues_;
 	std::vector<std::set<std::string>>      simulator_core_task_mappings_;
-	std::vector<std::string, std::uint64_t> simulator_task_core_mappings_;
+	std::map<std::string, std::uint64_t>    simulator_task_core_mappings_;
 	std::vector<time_window_t>              simulator_simulation_window_;
 	std::uint64_t                           simulator_performance_ratio_;
 

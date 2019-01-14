@@ -189,6 +189,41 @@ void AbstractedControlSystem::ready_offline_guider(void)
 	
 }
 
+/*
+ * @brief Run online-progressive scheduling assuming multi-core usage
+ *				based on Kyoung-Soo We and Wonseok Lee's approach
+ *
+ * @param num_of_hyper_periods Online-progressive scheduling algorithm will
+ *														 simulate the whole system during the num_of_hyper_periods * HP
+ *
+ */
+
+void AbstractedControlSystem::run_online_progressive_scheduling(
+	std::uint64_t num_of_hyper_periods)
+{
+	// Progress Simulation until num_of_hyper_period * hyper_period_
+	for (std::uint64_t synthesized_tick = 0; synthesized_tick < num_of_hyper_periods*hyper_period_; ++synthesized_tick)
+	{
+		std::vector<AbstractedJob*> jobs_to_be_added;
+		
+		find_jobs_to_be_added(synthesized_tick, jobs_to_be_added);
+
+		add_jobs_to_ready_queue(jobs_to_be_added);
+
+		std::vector<AbstractedJob*> completed_jobs;
+
+		progress_one_tick(synthesized_tick, completed_jobs);
+
+		if (completed_jobs.empty())
+			continue;
+
+		update_ojpg(completed_jobs);
+
+	}
+
+	std::cout << "Simulatable (E:" << ecus_.size() << ", T:" << tasks_.size() << ")" << std::endl;
+}
+
 /* 
  * @brief Spwan 2 * (H.P / Pi) jobs for each task Ti and connect deterministic edges
  *			  between two consectuvie jos of task Ti 
@@ -355,5 +390,262 @@ void AbstractedControlSystem::partition_start_time_set(
 		}
 	}
 }
+
+/* 
+ * @brief Calculate finish-time set of given job
+ *		    
+ * @param job : The pointer of job whose finish-time set is calculated
+ */
+
+void AbstractedControlSystem::calculate_finish_time_set(
+	AbstractedJob* job)
+{
+	std::uint64_t wcbp_start_real;
+	std::uint64_t max_t_f_real;
+
+	const AbstractedEcu *mapped_ecu = job->mapped_task_->mapped_ecu_;
+	
+	std::int64_t wcbp_start_real_it;
+	for (wcbp_start_real_it = job->max_t_f_real_ - 1; wcbp_start_real_it >= 0; --wcbp_start_real_it)
+	{
+		if (worse_case_execution_window_[mapped_ecu->name_][wcbp_start_real_it].compare("EMPTY") == 0)
+			break;
+	}
+	wcbp_start_real = ++wcbp_start_real_it;
+
+	if (job->which_period_ == 1)
+		wcbp_start_real = std::max<std::uint64_t>(wcbp_start_real, hyper_period_);
+
+	max_t_f_real = job->max_t_f_real_;
+
+	for (auto task_it = mapped_ecu->pended_tasks_.begin(); task_it != mapped_ecu->pended_tasks_.end(); ++task_it)
+	{
+		// Skip lower priority tasks
+		// If two different tasks have the same period, then priorities will be assigned following lexicographic order of their task names
+		if ((*task_it)->p_ > job->mapped_task_->p_)
+			continue;
+		else if ((*task_it)->p_ == job->mapped_task_->p_ && (*task_it)->name_.compare(job->mapped_task_->name_) >= 0)
+			continue;
+
+		//Find finish-time set
+		for (auto job_it = (*task_it)->pended_offline_guider_jobs_.begin(); job_it != (*task_it)->pended_offline_guider_jobs_.end(); ++job_it)
+		{
+			//어떤 job의 release time이 worst-case busy period보다는 크고, 우선순위 높은 job의 maximum finish time보다는 작을 때, finish-time set에 insert
+			if (wcbp_start_real <= (*job_it)->t_r_real_ && (*job_it)->t_r_real_ < max_t_f_real)
+				job->j_f_.insert((*job_it));
+		}
+	}
+
+	//finish-time set은 자기자신도 들어감 
+	job->j_f_.insert(job);
+
+}
+
+/*
+ * @brief Partition finish-time set of given job by deterministic and non-deterministic predecessors
+ *				hat (^) jobs will be added
+ *
+ *
+ * @param job : The pointer of job whose finish-time set is partitioned
+ */
+
+void AbstractedControlSystem::partition_finish_time_set(
+	AbstractedJob* job)
+{
+	AbstractedJob *hat_job = new AbstractedJob(job->name_ + "^", job->mapped_task_, job->which_period_);
+	//execution time 0 만들기 위해서 
+	hat_job->min_t_s_real_ = job->min_t_f_real_;
+	hat_job->max_t_s_real_ = job->min_t_f_real_;
+	hat_job->min_t_f_real_ = hat_job->max_t_s_real_;
+	hat_job->max_t_f_real_ = hat_job->max_t_s_real_;
+
+	for (auto job_it = job->j_f_.begin(); job_it != job->j_f_.end(); ++job_it)
+	{
+		//job_it가 우선 실행될게 확실 
+		if ((*job_it)->max_t_s_real_ < job->min_t_f_real_)
+		{
+			hat_job->j_f_det_predecessors_.insert((*job_it));
+			(*job_it)->j_f_det_successors_.insert(hat_job);
+		}
+		else
+		{
+			hat_job->j_f_nodet_predecessors_.insert((*job_it));
+			(*job_it)->j_f_det_successors_.insert(hat_job);
+		}
+
+	}
+	
+	//offline guider에 hat job도 push 
+	offline_guider_.push_back(hat_job);
+}
+
+/*
+ * @brief Calculate producer-time set of given job
+ *
+ * @param job : The pointer of job whose producer-time set is calculated
+ */
+
+void AbstractedControlSystem::calculate_producer_time_set(
+	AbstractedJob* job)
+{
+	//potential producer의 finish time set U its own start-time set
+	const AbstractedTask *mapped_task = job->mapped_task_;
+	for (auto task_it = mapped_task->producer_tasks_.begin(); task_it != mapped_task->producer_tasks_.end(); ++task_it)
+	{
+		for (auto job_it = (*task_it)->pended_offline_guider_jobs_.begin(); job_it != (*task_it)->pended_offline_guider_jobs_.end(); ++job_it)
+		{
+			//Potential producers' finish-time set
+			//내 job의 최대시작시간보다 일찍수행이 종료되는 job의 finish time set + 내 job의 최소시작시간보다 최대종료시간이 긴 애들 
+			if (job->max_t_s_real_ >= (*job_it)->min_t_f_real_ && job->min_t_s_real_ <= (*job_it)->max_t_f_real_)
+			{
+				calculate_finish_time_set((*job_it));
+				for (auto j_f_it = (*job_it)->j_f_.begin(); j_f_it != (*job_it)->j_f_.end(); ++j_f_it)
+					job->j_p_.insert((*j_f_it));
+			}
+			
+		}
+	}
+	
+	//its own start-time set 
+	calculate_start_time_set(job);
+	for (auto j_s_it = job->j_s_.begin(); j_s_it != job->j_s_.end(); ++j_s_it)
+		job->j_p_.insert((*j_s_it));
+
+}
+
+/* 
+ * @brief Parition producer-time set of given job by deterministic and non-deterministic predecessors
+ *
+ * @param job : The pointer of job whose producer-time set is partitioned
+ */
+
+void AbstractedControlSystem::partition_producer_time_set(
+	AbstractedJob* job)
+{
+	// The first condition, among the job in J_p of this job (producer-time set안에서 edge det/non-det 나누는 것)
+	for (auto job_it = job->j_p_.begin(); job_it != job->j_p_.end(); ++job_it)
+	{
+		if ((*job_it)->max_t_s_real_ < job->min_t_s_real_)
+		{
+			job->j_p_det_predecessors_.insert((*job_it));
+			(*job_it)->j_p_det_successors_.insert(job);
+		}
+		else
+		{
+			job->j_p_nodet_predecessors_.insert((*job_it));
+			(*job_it)->j_p_nodet_successors_.insert(job);
+		}
+
+	}
+
+	const AbstractedTask *mapped_task = job->mapped_task_;
+	for (auto task_it = mapped_task->producer_tasks_.begin(); task_it != mapped_task->producer_tasks_.end(); ++task_it)
+	{
+		for (auto job_it = (*task_it)->pended_offline_guider_jobs_.begin(); job_it != (*task_it)->pended_offline_guider_jobs_.end(); ++job_it)
+		{
+			if (job_it + 1 == (*task_it)->pended_offline_guider_jobs_.end())
+				break;
+			
+			if ((*job_it)->max_t_f_real_ <= job->min_t_s_real_ && job->min_t_s_real_ < (*(job_it + 1))->max_t_f_real_)
+			{
+				job->j_p_det_predecessors_.insert((*job_it));
+				(*job_it)->j_p_det_successors_.insert(job);
+			}	
+		}
+	}
+}
+
+/* 
+ * @brief Find jobs that can be added to ready queues of each core
+ *				The jobs which has no un-completed deterministic predecessors
+ *				If the jobs has physical-read constraint, then this job should start after its real start time
+ *
+ * @param current_tick			current_tick
+ *        jobs_to_be_added  jobs that can be added to ready queues will be saved here
+ */
+void AbstractedControlSystem::find_jobs_to_be_added(
+	std::uint64_t current_tick,
+	std::vector<AbstractedJob*>& jobs_to_be_added)
+{
+	for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ++ojpg_it)
+	{
+		bool is_there_det_predecessors = false;
+		is_there_det_predecessors |= !(*ojpg_it)->j_prev_det_predecessors_.empty();
+		is_there_det_predecessors |= !(*ojpg_it)->j_s_det_predecessors_.empty();
+		is_there_det_predecessors |= !(*ojpg_it)->j_f_det_predecessors_.empty();
+		is_there_det_predecessors |= !(*ojpg_it)->j_p_det_predecessors_.empty();
+
+		if (!is_there_det_predecessors)
+		{
+			if ((*ojpg_it)->mapped_task_->physical_read_constraint_) // If this job has physical read constraint 
+			{
+				std::uint64_t t_s_real = (*ojpg_it)->min_t_s_real_;
+
+				if (t_s_real <= current_tick)
+					jobs_to_be_added.push_back((*ojpg_it));
+			}
+			else
+				jobs_to_be_added.push_back((*ojpg_it));
+		}
+	}
+}
+
+/**
+ *  @brief Add jobs to corresponding ready queues
+ *				 At this step, e_real_ and e_sim_ are randomly assigned
+ *				 To adjust ECU-PC execution performance ratio you should modify below function
+ *
+ *  @param jobs_to_be_added jobs to be added
+ *
+ */
+void AbstractedControlSystem::add_jobs_to_ready_queue(
+	std::vector<AbstractedJob*>& jobs_to_be_added)
+{
+	for (auto job_it = jobs_to_be_added.begin(); job_it != jobs_to_be_added.end(); ++job_it)
+	{
+		std::uint64_t mapped_core = simulator_task_core_mappings_[(*job_it)->mapped_task_->name_];
+		//already exist 
+		if (simulator_ready_queues_[mapped_core].insert(*job_it).second == false)
+			continue;
+		
+		std::uint64_t bcet = (*job_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+		std::uint64_t wcet = (*job_it)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		
+		//if this job is not hat job
+		if ((*job_it)->name_.find("^") == std::string::npos)
+		{
+			//job name의 index가 겹칠 일이 생길 수도?? 
+			/* Below for experiment */
+			srand((unsigned int)AbstractedJob::get_job_index((*job_it)->name_));
+			/* Above for experiment */
+			(*job_it)->e_real_ = (bcet + (rand() % (wcet - bcet + 1))) * simulator_performance_ratio_;
+			(*job_it)->e_sim_ = (*job_it)->e_real_ / simulator_performance_ratio_;
+		}
+		else
+			(*job_it)->e_real_ = (*job_it)->e_sim_ = 0;
+
+		//not executed yet, just pushed on ready-queue 
+		(*job_it)->executed_time_ = 0;
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
