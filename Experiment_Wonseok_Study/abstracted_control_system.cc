@@ -629,7 +629,260 @@ void AbstractedControlSystem::add_jobs_to_ready_queue(
 	}
 }
 
+/**
+ * @brief  Progress simulation as much as one tick
+ *				 Each core executes its the highest priority job following EDF order
+ *
+ *
+ * @param current_tick		current tick
+ * @param completed_jobs	jobs which is completed on simulator
+ */
 
+void AbstractedControlSystem::progress_one_tick(
+	std::uint64_t current_tick,
+	std::vector<AbstractedJob*>& completed_jobs)
+{
+	for (std::uint64_t core = 0; core < simulator_num_of_cores_; ++core)
+	{
+		//매 tick마다 empty를 넣어주는 이유?? 
+		simulator_simulation_window_[core].push_back("EMPTY");
+
+		//Hat-jobs should be finished right after it is added to ready queue
+		for (auto job_it = simulator_ready_queues_[core].begin(); job_it != simulator_ready_queues_[core].end();)
+		{
+			if ((*job_it)->name_.find("^") != std::string::npos)
+			{
+				completed_jobs.push_back((*job_it));
+				job_it = simulator_ready_queues_[core].erase(job_it);
+			}
+			else
+				++job_it;
+		}
+		
+		if (simulator_ready_queues_[core].empty())
+			continue;
+
+		// Find the highest priority job following EDF order
+		AbstractedJob* job_to_be_executed = nullptr;
+		for (auto job_it = simulator_ready_queues_[core].begin(); job_it != simulator_ready_queues_[core].end(); ++job_it)
+		{
+			if (job_to_be_executed == nullptr || (job_to_be_executed->t_d_sim_ > (*job_it)->t_d_sim_))
+				job_to_be_executed = (*job_it);
+		}
+		
+		//EMPTY를 job name으로 바꿔준다 
+		if (simulator_simulation_window_[core].back().compare("EMPTY") == 0)
+			simulator_simulation_window_[core].back() = job_to_be_executed->name_;
+		else
+			simulator_simulation_window_[core].back() += "," + job_to_be_executed->name_;
+		
+		//다른 job들은 ++ 안해줌?? (what if simulator_simulation_window의 back에 둘 이상의 job이 존재하면? 
+		++job_to_be_executed->executed_time_;
+		
+		if (job_to_be_executed->executed_time_ == job_to_be_executed->e_sim_)
+		{
+			completed_jobs.push_back(job_to_be_executed);
+			simulator_ready_queues_[core].erase(job_to_be_executed);
+		}
+	}
+
+	//Deadline miss check
+	for (auto completed_job_it = completed_jobs.begin(); completed_job_it != completed_jobs.end(); ++completed_job_it)
+	{
+		if ((*completed_job_it)->t_d_sim_ < current_tick + 1)
+		{
+			std::cerr << "AbstractedControlSytem::progress_one_tick(current_tick, completed_jobs)::";
+			std::cerr << "deadline miss is detected" << "(" << (*completed_job_it)->name_ << ")" << std::endl;
+			std::cout << "Not Simulatable (E: " << ecus_.size() << ", T:" << tasks_.size() << ")::deadline_miss" << std::endl;
+			exit(-1);
+		}
+	}
+}
+
+/**
+  * @brief	Ready partitioned EDF using below idea (by Wonseok Lee)
+	*					- The total memory usage of tasks mapped to a single core
+	*						does not exceed the last level cache size of its core
+	*					- other heuristics is determined by parameter
+	*
+	* @param	heuristics Smllest-Utilization-First when it is 0
+	*										 Worst-Fit-First when it is 1
+	*										 Smallest-Block-First when it is 2
+	* @param  num_of_cores Online-progressive scheduling algorithm will
+	*											 use num_of_cores CPU cores to simulating the system
+	*
+	*/
+void AbstractedControlSystem::ready_partitioned_edf(
+	std::uint64_t heuristics,
+	std::uint64_t num_of_cores)
+{
+	initialize_ojpg();
+
+	//1번째 HP는 버림 
+	//Drop the 1st HP's execution windows 
+	for (auto ecu_it = ecus_.begin(); ecu_it != ecus_.end(); ++ecu_it)
+	{
+		//begin에서 hyper_period까지는 버리고 다음 range의 hyper_period_부터로 resize 
+		best_case_execution_window_[(*ecu_it)->name_] = time_window_t(
+			best_case_execution_window_[(*ecu_it)->name_].begin() + hyper_period_,
+			best_case_execution_window_[(*ecu_it)->name_].end());
+		worst_case_execution_window_[(*ecu_it)->name_] = time_window_t(
+			worst_case_execution_window_[(*ecu_it)->name_].begin() + hyper_period_,
+			worst_case_execution_window_[(*ecu_it)->name_].end());
+	}
+
+	// Ready partitioned EDF
+	simulator_num_of_cores_ = num_of_cores;
+	
+	for(std::uint64_t core =0; )
+
+
+
+
+
+
+}
+
+/**
+  * @brief	Initialize OJPG from offline guider
+	*					Deep copy 1st HP's jobs of offline guider to the initial OJPG
+	*					Assign initial deadlines to the offline guider
+	*/
+void AbstractedControlSystem::initialize_ojpg(void)
+{
+	//Deep copy the second-HP's jobs
+	for (auto offline_guider_it = offline_guider_.begin(); offline_guider_it != offline_guider_.end(); ++offline_guider_it)
+	{
+		//means its jobs is in 2nd-HP
+		if ((*offline_guider_it)->which_period_ == 1)
+		{
+			//copy-constructor-> *offline_guider_it : AbstractedJob* 형태, const AbstractedJob& ref로 주려면 AbstractedJob object 필요 따라서 **offline_guider_it이 AbstractedJob을 pointing
+			AbstractedJob* ojpg_job = new AbstractedJob(*(*offline_guider_it));
+			ojpg_job->mapped_task_->pended_ojpg_jobs_.push_back(ojpg_job);
+			ojpg_.push_back(ojpg_job);
+		}
+	}
+
+	//Replace inks of copied jobs and adjust its timing parameter
+	for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ++ojpg_it)
+	{
+		AbstractedJob* offline_guider_job = *get_offline_guider_job_by_name((*ojpg_it)->name_);
+		
+		auto replacer = [&](std::set<AbstractedJob*>& ojpg_link, std::set<AbstractedJob*>& offline_guider_link)
+		{
+			ojpg_link.clear();
+			for (auto offline_guider_it = offline_guider_link.begin(); offline_guider_it != offline_guider_link.end(); ++offline_guider_it)
+			{
+				//get ojpg_job_by_name return type iterator -> *달아서 AbstractedJob* type으로 changing
+				if ((*offline_guider_it)->which_period_ == 1)
+					ojpg_link.insert(*get_ojpg_job_by_name( (*offline_guider_it)->name_) );
+			}
+
+
+		};
+		
+		replacer((*ojpg_it)->j_prev_det_predecessors_, offline_guider_job->j_prev_det_predecessors_);
+		replacer((*ojpg_it)->j_prev_det_successors_, offline_guider_job->j_prev_det_successors_);
+
+		replacer((*ojpg_it)->j_s_, offline_guider_job->j_s_);
+		replacer((*ojpg_it)->j_s_det_predecessors_, offline_guider_job->j_s_det_predecessors_);
+		replacer((*ojpg_it)->j_s_det_successors_, offline_guider_job->j_s_det_successors_);
+		replacer((*ojpg_it)->j_p_nodet_predecessors_, offline_guider_job->j_p_nodet_predecessors_);
+		replacer((*ojpg_it)->j_p_nodet_successors_, offline_guider_job->j_p_nodet_successors_);
+
+		replacer((*ojpg_it)->j_f_, offline_guider_job->j_f_);
+		replacer((*ojpg_it)->j_f_det_predecessors_, offline_guider_job->j_f_det_predecessors_);
+		replacer((*ojpg_it)->j_f_det_successors_, offline_guider_job->j_f_det_successors_);
+		replacer((*ojpg_it)->j_f_nodet_predecessors_, offline_guider_job->j_f_nodet_predecessors_);
+		replacer((*ojpg_it)->j_f_nodet_successors_, offline_guider_job->j_f_nodet_successors_);
+
+		replacer((*ojpg_it)->j_p_, offline_guider_job->j_p_);
+		replacer((*ojpg_it)->j_p_det_predecessors_, offline_guider_job->j_p_det_predecessors_);
+		replacer((*ojpg_it)->j_p_det_successors_, offline_guider_job->j_p_det_successors_);
+		replacer((*ojpg_it)->j_p_nodet_predecessors_, offline_guider_job->j_p_nodet_predecessors_);
+		replacer((*ojpg_it)->j_p_nodet_successors_, offline_guider_job->j_p_nodet_successors_);
+
+		(*ojpg_it)->t_r_real_-=hyper_period_;
+		(*ojpg_it)->min_t_s_real_ -= hyper_period_;
+		(*ojpg_it)->max_t_s_real_ -= hyper_period_;
+		(*ojpg_it)->min_t_f_real_ -= hyper_period_;
+		(*ojpg_it)->max_t_f_real_ -= hyper_period_;
+	}
+	assign_ojpg_deadlines();
+}
+
+/**
+  * @brief	Assign deadline for each job included in OJPG
+	*					This assignment is iterated until convergence occurs
+	*
+	*/
+void AbstractedControlSystem::assign_ojpg_deadlines(void)
+{
+	// Assign deadline : initial value
+	for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ojpg_it)
+	{
+		if ((*ojpg_it)->name_.find("^") != std::string::npos)
+		{
+			//assign deadline for each minimum finish time 
+			std::string non_hat_job_name = std::string((*ojpg_it)->name_.begin(), (*ojpg_it)->name_.end() - 1);
+			(*ojpg_it)->t_d_sim_ = (*get_ojpg_job_by_name(non_hat_job_name))->min_t_f_real_;
+		}
+		//assign deadline to maximum value of uint64_t
+		else
+			(*ojpg_it)->t_d_sim_ = std::numeric_limits<std::uint64_t>::max();
+	}
+
+	//Assign deadline : iterate for convergence 
+	while (true)
+	{
+		std::uint32_t number_of_updated_jobs = 0;
+		
+		for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ojpg_it++)
+		{
+			std::uint64_t new_t_d_sim = std::numeric_limits<std::uint64_t>::max();
+
+			//minimum 값만 찾기 때문에 constraint 다 돌면서 제일 작은 값
+
+			//Previous release relation successors
+			for (auto succ_it = (*ojpg_it)->j_prev_det_successors_.begin(); succ_it != (*ojpg_it)->j_prev_det_predecessors_.end(); ++succ_it)
+				new_t_d_sim = std::min<uint64_t>(new_t_d_sim, (*succ_it)->t_d_sim_);
+
+			//Start-time set relation successorss
+			for (auto succ_it = (*ojpg_it)->j_s_det_successors_.begin(); succ_it != (*ojpg_it)->j_s_det_successors_.end(); ++succ_it)
+				new_t_d_sim = std::min<uint64_t>(new_t_d_sim, (*succ_it)->t_d_sim_);
+
+			//Finish-time set relation successors
+			for (auto succ_it = (*ojpg_it)->j_f_det_successors_.begin(); succ_it != (*ojpg_it)->j_f_det_successors_.end(); ++succ_it)
+				new_t_d_sim = std::min<uint64_t>(new_t_d_sim, (*succ_it)->t_d_sim_);
+
+			//Producer-time set relation successors
+			for (auto succ_it = (*ojpg_it)->j_p_det_successors_.begin(); succ_it != (*ojpg_it)->j_p_det_successors_.end(); ++succ_it)
+				new_t_d_sim = std::min<uint64_t>(new_t_d_sim, (*succ_it)->t_d_sim_);
+
+			if (new_t_d_sim < (*ojpg_it)->t_d_sim_)
+			{
+				(*ojpg_it)->t_d_sim_ = new_t_d_sim;
+				++number_of_updated_jobs;
+			}
+		}
+
+		if (number_of_updated_jobs == 0)
+			break;
+	}
+}
+
+
+
+/**
+  * @brief	Update OJPG
+	*					- Adding next HP's jobs of completed jobs
+	*				  - Narrowing execution windows using completed jobs' virtually assigned execution time
+	*					- Deleting completed jobs from OJPG
+	*					- Resolving nondeterminism if it is possible
+	*					- Re-assigning deadline for each job in OJPG
+	*
+	*
+	*/
 
 
 

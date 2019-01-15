@@ -52,7 +52,7 @@ private:
 	std::uint64_t		 	   	  						    hyper_period_;
 	
 	std::map<std::string, time_window_t>    best_case_execution_window_;
-	std::map<std::string, time_window_t>    worse_case_execution_window_;
+	std::map<std::string, time_window_t>    worst_case_execution_window_;
 
 	std::uint64_t                           simulator_num_of_cores_;
 	std::vector<std::set<AbstractedJob*>>   simulator_ready_queues_;
