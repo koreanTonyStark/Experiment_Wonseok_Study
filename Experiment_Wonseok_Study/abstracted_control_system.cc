@@ -734,8 +734,171 @@ void AbstractedControlSystem::ready_partitioned_edf(
 	// Ready partitioned EDF
 	simulator_num_of_cores_ = num_of_cores;
 	
-	for(std::uint64_t core =0; )
+	//모두 empty한 것으로 initialize해서 push 
+	for (std::uint64_t core = 0; core < num_of_cores; ++core)
+	{
+		
+		simulator_ready_queues_.push_back(std::set<AbstractedJob*>());
+		simulator_core_task_mappings_.push_back(std::set <std::string>());
+	}
+	//각 core마다 simulation window를 assign 
+	simulator_simulation_window_.assign(simulator_num_of_cores_, time_window_t());
+	
+	if (heuristics == AbstractedControlSystem::heuristics_suf)
+	{
+		std::vector<std::uint64_t> simulator_mem_bin(simulator_num_of_cores_, 256); //최대 용량 256kb로 잡음 
+		std::vector<double> simulator_util_bin(simulator_num_of_cores_, 0.0); //4개 core의 bin에 처음에 다 utilization 0.0 
+		
+		for (auto task_it = tasks_.begin(); task_it != tasks_.end(); ++task_it)
+		{
+			double min_util = std::numeric_limits<double>::max();
+			std::uint64_t min_util_core = 0;
+			
+			for (std::uint64_t core = 0; core < simulator_num_of_cores_; ++core)
+			{
+				if (simulator_mem_bin[core] >= (*task_it)->memory_usage_ && min_util > simulator_util_bin[core]  )
+				{
+					min_util = simulator_util_bin[core];
+					min_util_core = core;
+				}
 
+				if (min_util == std::numeric_limits<double>::max())
+				{
+					std::cout << "Not Simulatable (E: " << ecus_.size() << ", T:" << tasks_.size() << ")::memory_constraint_violation" << std::endl;
+					exit(-1);
+				}
+			}
+
+			//사용되지 않응 양은 빼고 
+			simulator_mem_bin[min_util_core] -= (*task_it)->memory_usage_;
+			//사용된 양은 더한다 
+			simulator_util_bin[min_util_core] += (double)((*task_it)->c_worst_) / (double)((*task_it)->p_);
+			
+			simulator_core_task_mappings_[min_util_core].insert((*task_it)->name_);
+			simulator_task_core_mappings_[(*task_it)->name_] = min_util_core;
+
+			std::cerr << (*task_it)->name_ << "::" << min_util_core << "::" << min_util << std::endl;
+		}
+	}
+	//worst-fit first 
+	else if (heuristics == AbstractedControlSystem::heuristics_wff)
+	{
+		//사용하지 않은 용량 
+		std::vector<std::uint64_t> simulator_mem_bin(simulator_num_of_cores_, 256);
+		
+		for (auto task_it = tasks_.begin(); task_it != tasks_.end(); ++task_it)
+		{
+			
+			std::uint64_t max_mem = std::numeric_limits<uint64_t>::min();
+			std::uint64_t max_mem_core = 0;
+
+			for (std::uint64_t core = 0; core < simulator_num_of_cores_; ++core)
+			{
+				if (simulator_mem_bin[core] >= (*task_it)->memory_usage_ && max_mem < simulator_mem_bin[core])
+				{
+					//남은 용량이 최대인 core와 그 메모리 양을 찾음 
+					max_mem = simulator_mem_bin[core]; 
+					max_mem_core = core;
+				}
+			}
+			
+			if (max_mem == std::numeric_limits<std::uint64_t>::min())
+			{
+				std::cout << "Not Simulatable (E: " << ecus_.size() << ", T:" << tasks_.size() << ")::memory_constraint_violation" << std::endl;
+				exit(-1);
+			}
+
+			simulator_mem_bin[max_mem_core] -= (*task_it)->memory_usage_;
+			
+			simulator_core_task_mappings_[max_mem_core].insert((*task_it)->name_);
+			simulator_task_core_mappings_[(*task_it)->name_] = max_mem_core;
+			
+			std::cerr << (*task_it)->name_ << "::" << max_mem_core << "::" << max_mem << std::endl;
+		}
+	}
+	else if (heuristics == AbstractedControlSystem::heuristics_sbf)
+	{
+		//memory양 (256kb)
+		std::vector<std::uint64_t> simulator_mem_bin(simulator_num_of_cores_, 256);
+		//smallest block 찾으려고 각 core마다 block값을 저장 
+		std::vector<std::vector<std::string> > simulator_block_bins;
+
+		AbstractedJob* vs_sparse = initialize_sparse_graph();
+		assign_epst(vs_sparse);
+
+		AbstractedJob* vs_dense = initialize_dense_graph();
+		assign_lpft(vs_dense);
+
+		simulator_block_bins.assign(simulator_num_of_cores_, std::vector<std::string>());
+
+		for (auto task_to_be_added = tasks_.begin(); task_to_be_added != tasks_.end(); ++task_to_be_added)
+		{
+			std::uint64_t min_block_core;
+			double min_block_value = std::numeric_limits<double>::max();
+			
+			for (std::uint64_t core = 0; core < simulator_num_of_cores_; ++core)
+			{
+				//남은 양이 현재 task의 memory usage보다 작다면 못 넣기 때문에 pass 
+				if (simulator_mem_bin[core] < (*task_to_be_added)->memory_usage_)
+					continue;
+				
+				double block_value = 0;
+
+				for (auto job_it = (*task_to_be_added)->pended_ojpg_jobs_.begin(); job_it != (*task_to_be_added)->pended_ojpg_jobs_.end(); ++job_it)
+				{
+					//if the job is not hat job, then continue
+					if ((*job_it)->name_.find("^") != std::string::npos)
+						continue;
+
+					std::uint64_t my_epst = (*get_sparse_graph_job_by_name((*job_it)->name_))->epst_;
+					std::uint64_t my_lpft = (*get_dense_graph_job_by_name((*job_it)->name_))->lpft_;
+					double my_weight = ((double)((*task_to_be_added)->c_worst_) / (double)simulator_performance_ratio_) / ((double)my_lpft - (double)my_epst);
+					
+					for (auto existing_job = simulator_block_bins[core].begin(); existing_job != simulator_block_bins[core].end(); ++existing_job)
+					{
+						if (existing_job->find("^") != std::string::npos)
+							continue;
+
+						AbstractedJob* your_job = (*get_ojpg_job_by_name(*existing_job));
+
+						std::uint64_t your_epst = (*get_sparse_graph_job_by_name(*existing_job))->epst_;
+						std::uint64_t your_lpft = (*get_dense_graph_job_by_name(*existing_job))->lpft_;
+						double your_weight = ((double)(your_job->mapped_task_->c_worst_) / (double)simulator_performance_ratio_ / ((double)your_lpft - (double)your_epst));
+
+						if (my_epst <= your_epst && my_lpft > your_epst)
+							block_value += (double)(std::min<std::uint64_t>(my_lpft, your_lpft) - your_epst) * my_weight * your_weight;
+						else if (my_epst > your_epst && my_epst < your_lpft)
+							block_value += (double)(std::min<std::uint64_t>(my_lpft, your_lpft) - my_epst) * my_weight * your_weight;
+					}
+				}
+				
+				if (block_value < min_block_value)
+				{
+					min_block_value = block_value;
+					min_block_core = core;
+				}
+
+				if (min_block_value == std::numeric_limits<double>::max() )
+				{
+					std::cout << " Not Simulatable (E: " << ecus_.size() << ", T" << tasks_.size() << ")::memory_constraint_violation" << std::endl;
+					exit(-1);
+				}
+			}
+			simulator_mem_bin[min_block_core] -= (*task_to_be_added)->memory_usage_;
+			
+			simulator_core_task_mappings_[min_block_core].insert((*task_to_be_added)->name_);
+			simulator_task_core_mappings_[(*task_to_be_added)->name_] = min_block_core;
+
+			std::cerr << (*task_to_be_added)->name_ << "::" << min_block_core << "::" << min_block_value << std::endl;
+
+			for (auto job_it = (*task_to_be_added)->pended_ojpg_jobs_.begin(); job_it != (*task_to_be_added)->pended_ojpg_jobs_.end(); ++job_it)
+				simulator_block_bins[min_block_core].push_back((*job_it)->name_);
+		}
+		
+		delete vs_sparse;
+		delete vs_dense;
+	}
+	
 
 
 
@@ -883,13 +1046,257 @@ void AbstractedControlSystem::assign_ojpg_deadlines(void)
 	*
 	*
 	*/
+void AbstractedControlSystem::update_ojpg(
+	std::vector<AbstractedJob*>& completed_jobs)
+{
+	update_ojpg_add_new_jobs(completed_jobs);
+
+	update_ojpg_narrow_execution_windows();
+
+	update_ojpg_delete_completed_jobs(completed_jobs);
+
+	update_ojpg_resolve_nondeterminism();
+
+	assign_ojpg_deadlines();
+}
+
+/** 
+  * @brief	Add a newly created jobs due to job completion to the OJPG
+	*					Newly created jobs are next HP's jobs of completed jobs
+	*
+	* @param	completed_jobs	jobs which is completed on simulator
+	*/
+void AbstractedControlSystem::update_ojpg_add_new_jobs(
+	std::vector<AbstractedJob*>& completed_jobs)
+{
+	for (auto completed_jobs_it = completed_jobs.begin(); completed_jobs_it != completed_jobs.end(); ++completed_jobs_it)
+	{
+		
+		// Copy and add a node
+		AbstractedTask *job_to_be_added_mapped_task = (*completed_jobs_it)->mapped_task_;
+		
+		std::uint64_t job_to_be_added_job_idx;
+		//끝난 job의 index 먼저 구하고 
+		job_to_be_added_job_idx = AbstractedJob::get_job_index((*completed_jobs_it)->name_);
+		//hyperPeriod/Period 해서 다음 hyper_period까지의 job의 index를 구한다 -> 만약에 hyperPeriod에서 P 나눈 값이 1이 아닌 경우?, 즉 2 이상인 경우 어캄? 
+		//->한 tick마다 진행하므로 무조건 하나 존재, J_11 J_12 가 한 HP라 하면, J_11 수행 후 J_13 생성 
+		job_to_be_added_job_idx += (hyper_period_ / job_to_be_added_mapped_task->p_);
+
+		std::string job_to_be_added_job_name;
+		job_to_be_added_job_name = AbstractedJob::assemble_job_name((*completed_jobs_it)->name_, job_to_be_added_job_idx);
+		
+		std::uint64_t job_to_be_added_which_period;
+		job_to_be_added_which_period = AbstractedJob::get_job_index(job_to_be_added_job_name) / (hyper_period_ / job_to_be_added_job_idx);
+
+		AbstractedJob *job_to_be_added = new AbstractedJob(job_to_be_added_job_name, job_to_be_added_mapped_task, job_to_be_added_which_period);
+		job_to_be_added->t_r_real_ = (*completed_jobs_it)->t_r_real_ + hyper_period_;
+		job_to_be_added->mapped_task_->pended_ojpg_jobs_.push_back(job_to_be_added);
+		ojpg_.push_back(job_to_be_added);
+
+		//Find corresponding jobs on offline guider
+		std::uint64_t corresponding_offline_guider_job_in_0th_hp_idx;
+		std::uint64_t corresponding_offline_guider_job_in_1st_hp_idx;
+
+		corresponding_offline_guider_job_in_0th_hp_idx = AbstractedJob::get_job_index(job_to_be_added_job_name);
+		corresponding_offline_guider_job_in_0th_hp_idx %= (hyper_period_ / job_to_be_added_mapped_task->p_);
+
+		corresponding_offline_guider_job_in_1st_hp_idx = AbstractedJob::get_job_index(job_to_be_added_job_name);
+		corresponding_offline_guider_job_in_1st_hp_idx %= (hyper_period_ / job_to_be_added_mapped_task->p_);
+		corresponding_offline_guider_job_in_1st_hp_idx += (hyper_period_ / job_to_be_added_mapped_task->p_);
+		
+		std::string corresponding_offline_guider_job_in_0th_hp_name;
+		std::string corresponding_offline_guider_job_in_1st_hp_name;
+
+		corresponding_offline_guider_job_in_0th_hp_name = AbstractedJob::assemble_job_name(job_to_be_added_job_name, corresponding_offline_guider_job_in_0th_hp_idx);
+		corresponding_offline_guider_job_in_1st_hp_name = AbstractedJob::assemble_job_name(job_to_be_added_job_name, corresponding_offline_guider_job_in_1st_hp_idx);
+
+		AbstractedJob* corresponding_offline_guider_job_in_0th_hp = *get_offline_guider_job_by_name(corresponding_offline_guider_job_in_0th_hp_name);
+		AbstractedJob* corresponding_offline_guider_job_in_1st_hp = *get_offline_guider_job_by_name(corresponding_offline_guider_job_in_1st_hp_name);
+
+		update_ojpg_copy_links(job_to_be_added, corresponding_offline_guider_job_in_0th_hp);
+		update_ojpg_copy_links(job_to_be_added, corresponding_offline_guider_job_in_1st_hp);
+	}
+}
+
+/**
+  * @brief	Copy links of offline guider job to the newly added ojpg job
+	*
+	*
+	* @param	ojpg_job													job which is newly added to the ojpg
+	* @param	corresponding_offline_guider_job	corresponding offline guider job of ojpg_job
+	*/
+void AbstractedControlSystem::update_ojpg_copy_links(
+	AbstractedJob* ojpg_job,
+	AbstractedJob* corresponding_offline_guider_job)
+{
+	std::set<AbstractedJob*>::iterator link_begin, link_end;
+	for (std::uint16_t links_type = 0; links_type < 14; ++links_type)
+	{
+		switch (links_type)
+		{
+		case 0:
+			link_begin = corresponding_offline_guider_job->j_prev_det_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_prev_det_predecessors_.end();
+			break;
+		case 1:
+			link_begin = corresponding_offline_guider_job->j_prev_det_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_prev_det_successors_.end();
+			break;
+		case 2:
+			link_begin = corresponding_offline_guider_job->j_s_det_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_s_det_predecessors_.end();
+			break;
+		case 3:
+			link_begin = corresponding_offline_guider_job->j_s_det_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_s_det_successors_.end();
+			break;
+		case 4:
+			link_begin = corresponding_offline_guider_job->j_s_nodet_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_s_nodet_predecessors_.end();
+			break;
+		case 5:
+			link_begin = corresponding_offline_guider_job->j_s_nodet_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_s_nodet_successors_.end();
+			break;
+		case 6:
+			link_begin = corresponding_offline_guider_job->j_f_det_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_f_det_predecessors_.end();
+			break;
+		case 7:
+			link_begin = corresponding_offline_guider_job->j_f_det_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_f_det_successors_.end();
+		case 8:
+			link_begin = corresponding_offline_guider_job->j_f_nodet_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_f_nodet_predecessors_.end();
+			break;
+		case 9:
+			link_begin = corresponding_offline_guider_job->j_f_nodet_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_f_nodet_successors_.end();
+			break;
+		case 10:
+			link_begin = corresponding_offline_guider_job->j_p_det_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_p_det_predecessors_.begin();
+			break;
+		case 11:
+			link_begin = corresponding_offline_guider_job->j_p_det_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_p_det_successors_.end();
+			break;
+		case 12:
+			link_begin = corresponding_offline_guider_job->j_p_nodet_predecessors_.begin();
+			link_end = corresponding_offline_guider_job->j_p_nodet_predecessors_.end();
+			break;
+		case 13:
+			link_begin = corresponding_offline_guider_job->j_p_nodet_successors_.begin();
+			link_end = corresponding_offline_guider_job->j_p_nodet_successors_.end();
+			break;
+		}
+
+		std::uint64_t ojpg_job_which_period = ojpg_job->which_period_;
+		std::uint64_t corresponding_offline_guider_job_which_period = corresponding_offline_guider_job->which_period_;
+
+		std::uint64_t period_diff = ojpg_job_which_period - corresponding_offline_guider_job_which_period;
+
+		for (auto link_it = link_begin; link_it != link_end; ++link_it)
+		{
+			AbstractedJob *linked_job = *link_it;
+			
+			//edge걸려있는 놈들의 idx 값 빼내오기 
+			std::uint64_t expected_ojpg_job_idx;
+			expected_ojpg_job_idx = AbstractedJob::get_job_index(linked_job->name_);
+			expected_ojpg_job_idx += (period_diff) * (hyper_period_ / linked_job->mapped_task_->p_);
+
+			std::string expected_ojpg_job_name;
+			expected_ojpg_job_name = AbstractedJob::assemble_job_name(linked_job->name_, expected_ojpg_job_idx);
+
+			if (get_ojpg_job_by_name(expected_ojpg_job_name) == ojpg_.end())
+				continue;
+
+			//offline-guider에서 relation예상되는 job 
+			AbstractedJob *expected_ojpg_job = *get_ojpg_job_by_name(expected_ojpg_job_name);
+			switch (links_type)
+			{
+			case 0:
+				ojpg_job->j_prev_det_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_prev_det_successors_.insert(ojpg_job);
+				break;
+			case 1:
+				ojpg_job->j_prev_det_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_prev_det_predecessors_.insert(ojpg_job);
+				break;
+			case 2:
+				ojpg_job->j_s_det_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_s_det_successors_.insert(ojpg_job);
+				break;
+			case 3:
+				ojpg_job->j_s_det_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_s_det_predecessors_.insert(ojpg_job);
+				break;
+			case 4:
+				ojpg_job->j_s_nodet_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_s_nodet_successors_.insert(ojpg_job);
+				break;
+			case 5:
+				ojpg_job->j_s_nodet_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_s_nodet_predecessors_.insert(ojpg_job);
+				break;
+			case 6:
+				ojpg_job->j_f_det_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_f_det_successors_.insert(ojpg_job);
+				break;
+			case 7:
+				ojpg_job->j_f_det_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_f_det_predecessors_.insert(ojpg_job);
+				break;
+			case 8:
+				ojpg_job->j_f_nodet_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_f_nodet_successors_.insert(ojpg_job);
+				break;
+			case 9:
+				ojpg_job->j_f_nodet_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_f_nodet_predecessors_.insert(ojpg_job);
+				break;
+			case 10:
+				ojpg_job->j_p_det_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_p_det_successors_.insert(ojpg_job);
+				break;
+			case 11:
+				ojpg_job->j_p_det_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_p_det_predecessors_.insert(ojpg_job);
+				break;
+			case 12:
+				ojpg_job->j_p_nodet_predecessors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_p_nodet_successors_.insert(ojpg_job);
+				break;
+			case 13:
+				ojpg_job->j_p_det_successors_.insert(expected_ojpg_job);
+				(expected_ojpg_job)->j_p_det_predecessors_.insert(ojpg_job);
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * @brief	Narrow start/finish-time range of OJPG jobs using completed jobs
+ *
+ */
+void AbstractedControlSystem::update_ojpg_narrow_execution_windows(void)
+{
+	//1 copy다 뜨고 나서 
+	//2 execution window 좁히고
+	//3 completed job delete
+	//4 nondeterminism resolve
+	//5 deadline assign 
+
+	//we are in step 2 for this function 
+
+	//Do Tomorrow!!
 
 
 
 
 
-
-
+}
 
 
 

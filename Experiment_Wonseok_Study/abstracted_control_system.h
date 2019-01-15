@@ -118,7 +118,7 @@ private:
 		AbstractedJob* ojpg_job,
 		AbstractedJob* corresponding_offline_guider_job);
 	
-	void update_ojpg_narrow_execution_window(void);
+	void update_ojpg_narrow_execution_windows(void);
 
 	void update_ojpg_delete_completed_jobs(
 		std::vector<AbstractedJob*>& completed_jobs);
@@ -136,7 +136,7 @@ private:
 		const std::string job_name);
 	std::vector<AbstractedJob*>::iterator get_sparse_graph_job_by_name(
 		const std::string job_name);
-	std::vector<AbstractedJob*>::iterator get_desne_graph_job_by_name(
+	std::vector<AbstractedJob*>::iterator get_dense_graph_job_by_name(
 		const std::string job_name);
 	
 
