@@ -197,7 +197,6 @@ void AbstractedControlSystem::ready_offline_guider(void)
  *														 simulate the whole system during the num_of_hyper_periods * HP
  *
  */
-
 void AbstractedControlSystem::run_online_progressive_scheduling(
 	std::uint64_t num_of_hyper_periods)
 {
@@ -309,7 +308,7 @@ void AbstractedControlSystem::calculate_execution_windows(void)
 		filler(best_case_execution_window_, 0);
 
 		//maximum start time + maximum finish time 
-		filler(worse_case_execution_window_, 1);
+		filler(worst_case_execution_window_, 1);
 	}
 }
 
@@ -332,7 +331,7 @@ void AbstractedControlSystem::calculate_start_time_set(
 	for (wcbp_start_real_it = job->max_t_f_real_ - 1; wcbp_start_real_it >= 0; --wcbp_start_real_it)
 	{
 		//"EMPTY"인 곳 찾으면 거기는 busy-period안에 속하지 X, busy-period : 내가 release되고 나보다 priority 높은 job이나 내가 수행될때까지의 시간 
-		if (worse_case_execution_window_[mapped_ecu->name_][wcbp_start_real_it].compare("EMPTY") == 0)
+		if (worst_case_execution_window_[mapped_ecu->name_][wcbp_start_real_it].compare("EMPTY") == 0)
 			break;
 	}
 	//empty인 곳이 발견 되면 worst-case busy period가 
@@ -408,7 +407,7 @@ void AbstractedControlSystem::calculate_finish_time_set(
 	std::int64_t wcbp_start_real_it;
 	for (wcbp_start_real_it = job->max_t_f_real_ - 1; wcbp_start_real_it >= 0; --wcbp_start_real_it)
 	{
-		if (worse_case_execution_window_[mapped_ecu->name_][wcbp_start_real_it].compare("EMPTY") == 0)
+		if (worst_case_execution_window_[mapped_ecu->name_][wcbp_start_real_it].compare("EMPTY") == 0)
 			break;
 	}
 	wcbp_start_real = ++wcbp_start_real_it;
@@ -1289,21 +1288,855 @@ void AbstractedControlSystem::update_ojpg_narrow_execution_windows(void)
 	//5 deadline assign 
 
 	//we are in step 2 for this function 
+	//mode : 0 -> best execution time window narrowing 
+	//mode : 1 -> worst execution time window narrowing
 
-	//Do Tomorrow!!
+	for (auto ecu_it = ecus_.begin(); ecu_it != ecus_.end(); ++ecu_it)
+	{
+		auto filler = [&](std::map<std::string, time_window_t>& window, const std::uint64_t num_of_hyper_periods, const std::uint8_t mode)
+		{
+			window[(*ecu_it)->name_] = time_window_t(num_of_hyper_periods * hyper_period_, "EMPTY");
+
+			for (auto task_it = (*ecu_it)->pended_tasks_.begin(); task_it != (*ecu_it)->pended_tasks_.end(); ++task_it)
+			{
+				//vector constructor pended job의 execution window를 줄이는 것 
+				std::vector<AbstractedJob*> jobs_to_be_updated((*task_it)->pended_ojpg_jobs_.begin(), (*task_it)->pended_ojpg_jobs_.end());
+				//position에서 pneded_job먼저 넣고 pended_completed_ojpg_job을 insert 
+				jobs_to_be_updated.insert(jobs_to_be_updated.end(), (*task_it)->pended_completed_ojpg_jobs_.begin(), (*task_it)->pended_completed_ojpg_jobs_.end());
+
+				for (auto job_it = jobs_to_be_updated.begin(); job_it != jobs_to_be_updated.end(); ++job_it)
+				{
+					//hat-job then, no more stuffs to do 
+					if ((*job_it)->name_.find("^") != std::string::npos)
+						continue;
+
+					std::uint64_t executed_time = 0;
+					std::uint64_t current_time = (*job_it)->t_r_real_;
+
+					std::uint64_t job_execution_time;
+					if ((*job_it)->executed_time_ == (*job_it)->e_sim_)
+						job_execution_time = (*job_it)->e_real_;
+					else if (mode == 0)
+						job_execution_time = (*task_it)->c_best_;
+					else if (mode == 1)
+						job_execution_time = (*task_it)->c_worst_;
+						
+					while (executed_time < job_execution_time)
+					{
+						if (window[(*ecu_it)->name_][current_time].compare("EMPTY") == 0)
+						{
+							if (executed_time == 0)
+								(mode == 0 ? (*job_it)->min_t_s_real_ : (*job_it)->max_t_s_real_) = current_time;
+
+							window[(*ecu_it)->name_][current_time] = (*job_it)->name_;
+							++executed_time;
+						}
+						++current_time;
+					}
+					(mode == 0 ? (*job_it)->min_t_f_real_ : (*job_it)->max_t_f_real_) = current_time;
+				}
+			}
+		};
+		
+		std::uint64_t max_hyper_periods = 1;
+		for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ++ojpg_it)
+		{
+			AbstractedTask *mapped_task = (*ojpg_it)->mapped_task_;
+			std::uint64_t which_period = AbstractedJob::get_job_index((*ojpg_it)->name_) / (hyper_period_ / mapped_task->p_);
+			
+			max_hyper_periods = std::max<uint64_t>(max_hyper_periods, which_period);
+		}
+
+		filler(best_case_execution_window_, max_hyper_periods, 0);
+		filler(worst_case_execution_window_, max_hyper_periods, 1);
+	}
+
+	
+	for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ++ojpg_it)
+	{
+		if ((*ojpg_it)->name_.find("^") == std::string::npos)
+			continue;
+
+		std::string non_hat_job_name = std::string((*ojpg_it)->name_.begin(), (*ojpg_it)->name_.end() - 1);
+		
+		if (get_ojpg_job_by_name(non_hat_job_name) != ojpg_.end())
+		{
+			AbstractedJob* non_hat_job = *get_ojpg_job_by_name(non_hat_job_name);
+			(*ojpg_it)->min_t_s_real_ = non_hat_job->min_t_f_real_;
+			(*ojpg_it)->max_t_s_real_ = non_hat_job->max_t_f_real_;
+			(*ojpg_it)->min_t_f_real_ = (*ojpg_it)->min_t_s_real_;
+			(*ojpg_it)->max_t_f_real_ = (*ojpg_it)->max_t_s_real_;
+		}
+	}
+}
+
+/**
+  * @ brief	Delete completed jobs from OJPG
+	*
+	*
+	* @param	completed_jobs	jobs which is completed on simulator
+	*/
+void AbstractedControlSystem::update_ojpg_delete_completed_jobs(
+	std::vector<AbstractedJob*>& completed_jobs)
+{
+	for (auto completed_job_it = completed_jobs.begin(); completed_job_it != completed_jobs.end(); ++completed_job_it)
+	{
+		auto delete_expired_link = [&](std::set<AbstractedJob*>& links, std::uint16_t mode)
+		{
+			for (auto link_it = links.begin(); link_it != links.end(); ++link_it)
+			{
+				switch (mode)
+				{
+				case 0:
+					(*link_it)->j_prev_det_predecessors_.erase(*completed_job_it);
+					break;
+				case 1:
+					(*link_it)->j_s_det_predecessors_.erase(*completed_job_it);
+					break;
+				case 2:
+					(*link_it)->j_s_nodet_predecessors_.erase(*completed_job_it);
+					break;
+				case 3:
+					(*link_it)->j_f_det_predecessors_.erase(*completed_job_it);
+					break;
+				case 4:
+					(*link_it)->j_f_nodet_predecessors_.erase(*completed_job_it);
+					break;
+				case 5:
+					(*link_it)->j_f_det_predecessors_.erase(*completed_job_it);
+					break;
+				case 6:
+					(*link_it)->j_f_nodet_predecessors_.erase(*completed_job_it);
+					break;
+				}
+			}
+		};
+		
+		delete_expired_link((*completed_job_it)->j_prev_det_predecessors_, 0);
+		delete_expired_link((*completed_job_it)->j_s_det_predecessors_, 1);
+		delete_expired_link((*completed_job_it)->j_s_nodet_predecessors_, 2);
+		delete_expired_link((*completed_job_it)->j_f_det_predecessors_, 3);
+		delete_expired_link((*completed_job_it)->j_f_nodet_predecessors_, 4);
+		delete_expired_link((*completed_job_it)->j_p_det_predecessors_, 5);
+		delete_expired_link((*completed_job_it)->j_p_nodet_predecessors_, 6);
+
+		AbstractedTask *mapped_task = (*completed_job_it)->mapped_task_;
+
+		std::vector<AbstractedJob*>::iterator del_pos;
+		
+		del_pos = std::find(mapped_task->pended_ojpg_jobs_.begin(), mapped_task->pended_ojpg_jobs_.end(), (*completed_job_it));
+		mapped_task->pended_completed_ojpg_jobs_.erase(del_pos);
+
+		del_pos = std::find(ojpg_.begin(), ojpg_.end(), (*completed_job_it));
+		ojpg_.erase(del_pos);
+		
+		mapped_task->pended_completed_ojpg_jobs_.push_back(*completed_job_it);
+		completed_ojpg_.push_back(*completed_job_it);
+
+	}
+}
+
+/**
+  * @brief	Resolve nondeterminism using narrowed start/finish-time range
+	*
+	*/
+void AbstractedControlSystem::update_ojpg_resolve_nondeterminism(void)
+{
+	for (auto ojpg_it = ojpg_.begin(); ojpg_it != ojpg_.end(); ++ojpg_it)
+	{
+		//Resolve nondeterminism generated by physical read constraint(related to start time set)
+		for (auto succ_it = (*ojpg_it)->j_s_nodet_predecessors_.begin(); succ_it != (*ojpg_it)->j_s_nodet_successors_.end(); )
+		{
+			AbstractedJob* j_kl = (*ojpg_it);
+			AbstractedJob* j_ij = (*succ_it);
+			
+			//det-edge 되거나 
+			if (j_kl->max_t_s_real_ < j_ij->min_t_s_real_)
+			{
+				succ_it = j_kl->j_s_nodet_successors_.erase(succ_it);
+				j_ij->j_s_nodet_predecessors_.erase(j_kl);
+
+				j_kl->j_s_det_successors_.insert(j_ij);
+				j_ij->j_s_det_predecessors_.insert(j_kl);
+			}
+			//없어지거나 
+			else if (j_kl->min_t_s_real_ >= j_ij->max_t_s_real_)
+			{
+				succ_it = j_kl->j_s_nodet_successors_.erase(succ_it);
+				j_ij->j_s_nodet_predecessors_.erase(j_kl);
+
+			}
+			else
+				++succ_it;
+		}
+
+		// Resolve nondeterminism generated by physical write constraint (related to finish-time set)
+		for (auto succ_it = (*ojpg_it)->j_f_nodet_successors_.begin(); succ_it != (*ojpg_it)->j_f_nodet_successors_.end();)
+		{
+			AbstractedJob* j_kl = (*ojpg_it);
+			AbstractedJob* j_ij = (*succ_it);
+
+			if (j_ij->name_.find("^") != std::string::npos)
+			{
+				++succ_it;
+				continue;
+			}
+
+			if (j_kl->max_t_s_real_ < j_ij->min_t_f_real_)
+			{
+				succ_it = j_kl->j_f_nodet_successors_.erase(succ_it);
+				j_ij->j_f_nodet_predecessors_.erase(j_kl);
+
+				j_kl->j_f_det_successors_.insert(j_ij);
+				j_ij->j_f_det_predecessors_.insert(j_kl);
+			}
+			else if (j_kl->min_t_s_real_ >= j_ij->max_t_f_real_)
+			{
+				succ_it = j_kl->j_f_nodet_successors_.erase(succ_it);
+				j_ij->j_f_nodet_predecessors_.erase(j_kl);
+			}
+			else
+				++succ_it;
+		}
+
+		//Resolve nondeterminsm generated by producer consumer constraint
+		for (auto succ_it = (*ojpg_it)->j_p_nodet_successors_.begin(); succ_it != (*ojpg_it)->j_p_nodet_successors_.end(); )
+		{
+			AbstractedJob *j_kl = (*ojpg_it);
+			AbstractedJob *j_ij = (*succ_it);
+
+			if (j_kl->max_t_s_real_ < j_ij->min_t_s_real_)
+			{
+				succ_it = j_kl->j_p_nodet_successors_.erase(succ_it);
+				j_ij->j_p_nodet_predecessors_.erase(j_kl);
+
+				j_kl->j_p_det_successors_.insert(j_ij);
+				j_ij->j_p_det_predecessors_.insert(j_kl);
+			}
+			else if (j_kl->min_t_s_real_ >= j_ij->max_t_s_real_)
+			{
+				succ_it = j_kl->j_p_nodet_successors_.erase(succ_it);
+				j_ij->j_p_nodet_predecessors_.erase(j_kl);
+			}
+			else
+				++succ_it;
+		}
+	}
+}
+
+std::vector<AbstractedEcu*>::iterator AbstractedControlSystem::get_ecu_by_name(
+	const std::string ecu_name)
+{
+	std::vector<AbstractedEcu*>::iterator ret;
+	for (ret = ecus_.begin(); ret != ecus_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(ecu_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+std::vector<AbstractedTask*>::iterator AbstractedControlSystem::get_task_by_name(
+	const std::string task_name)
+{
+	std::vector<AbstractedTask*>::iterator ret;
+	for (ret = tasks_.begin(); ret != tasks_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(task_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+std::vector<AbstractedJob*>::iterator AbstractedControlSystem::get_offline_guider_job_by_name(
+	const std::string job_name)
+{
+	std::vector<AbstractedJob*>::iterator ret;
+	for (ret = offline_guider_.begin(); ret != offline_guider_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(job_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+std::vector<AbstractedJob*>::iterator AbstractedControlSystem::get_ojpg_job_by_name(
+	const std::string job_name)
+{
+	std::vector<AbstractedJob*>::iterator ret;
+	for (ret = ojpg_.begin(); ret != ojpg_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(job_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+std::vector<AbstractedJob*>::iterator AbstractedControlSystem::get_sparse_graph_job_by_name(
+	const std::string job_name)
+{
+	std::vector<AbstractedJob*>::iterator ret;
+	for (ret = sparse_graph_.begin(); ret != sparse_graph_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(job_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+std::vector<AbstractedJob*>::iterator AbstractedControlSystem::get_dense_graph_job_by_name(
+	const std::string job_name)
+{
+	std::vector<AbstractedJob*>::iterator ret;
+	for (ret = dense_graph_.begin(); ret != dense_graph_.end(); ++ret)
+	{
+		if ((*ret)->name_.compare(job_name) == 0)
+			break;
+	}
+	return ret;
+}
+
+template<class T>
+T AbstractedControlSystem::get_gcd(
+	const T a,
+	const T b)
+{
+	if (b == 0)
+		return a;
+	else
+		return get_gcd(b, a%b);
+}
+
+template<class T>
+T AbstractedControlSystem::get_lcm(
+	const std::vector<T>& number_array)
+{
+	if (number_array.empty())
+		return T(0);
+	
+	std::set<T> unique_number_array;
+	for (auto it = number_array.begin(); it != number_array.end(); ++it)
+		unique_number_array.insert((*it));
+	
+	T lcm = *unique_number_array.begin();
+	auto it = unique_number_array.begin();
+
+	++it;
+	for (; it != unique_number_array.end(); ++it)
+		lcm = ((*it)*lcm) / (AbstractedControlSystem::get_gcd<std::uint64_t>(*it, lcm));
+
+	return lcm;
+}
+
+/**
+  * @brief	Topological sort of graph rooted at root
+	*
+	*
+	* @param	root			root of DFS forest
+	* @param	stack			stack for tracing
+	* @param	visited		visited flags
+	*/
+void AbstractedControlSystem::topological_sort(
+	AbstractedJob* root,
+	std::vector<AbstractedJob*>& stack,
+	std::map<AbstractedJob*, bool>& visited)
+{
+	visited[root] = true;
+	
+	for (auto edge_it = root->edge_weights_.begin(); edge_it != root->edge_weights_.end(); ++edge_it)
+	{
+		if(visited[edge_it->first]==false)
+			topological_sort(edge_it->first, stack, visited);
+	}
+	
+	stack.push_back(root);
+	
+	return;
+}
+
+/**
+  * @brief	Initialize sparse graph which does not have ND-edges
+	*
+	*
+	* @return	Virtual start job
+	*/
+AbstractedJob* AbstractedControlSystem::initialize_sparse_graph(void)
+{
+	//Deep copy the second-HP's jobs
+	for (auto offline_guider_it = offline_guider_.begin(); offline_guider_it != offline_guider_.end(); ++offline_guider_it)
+	{
+		if ((*offline_guider_it)->which_period_ == 1) // only copy second period jobs
+		{
+			AbstractedJob* sparse_graph_job = new AbstractedJob(*(*offline_guider_it));
+			sparse_graph_job->mapped_task_->pended_sparse_graph_jobs_.push_back(sparse_graph_job);
+			sparse_graph_.push_back(sparse_graph_job);
+		}
+	}
+
+	//Replace links of copied jobs and adjust its timing parameter
+	for (auto sparse_graph_it = sparse_graph_.begin(); sparse_graph_it != sparse_graph_.end(); ++sparse_graph_it)
+	{
+		AbstractedJob* offline_guider_job = *get_offline_guider_job_by_name((*sparse_graph_it)->name_);
+
+		auto replacer = [&](std::set<AbstractedJob*>& sparse_graph_link, std::set<AbstractedJob*>& offline_guider_link)
+		{
+			sparse_graph_link.clear();
+			for (auto offline_guider_it = offline_guider_link.begin(); offline_guider_it != offline_guider_link.end(); ++offline_guider_it)
+			{
+				if ((*offline_guider_it)->which_period_ == 1) // Only the links among the 2nd HP should be copied
+					sparse_graph_link.insert(*get_sparse_graph_job_by_name((*offline_guider_it)->name_));
+			}
+		};
+
+		//Copy only deterministic edges 
+
+		replacer((*sparse_graph_it)->j_prev_det_predecessors_, offline_guider_job->j_prev_det_predecessors_);
+		replacer((*sparse_graph_it)->j_prev_det_successors_, offline_guider_job->j_prev_det_successors_);
+
+		replacer((*sparse_graph_it)->j_s_det_predecessors_, offline_guider_job->j_s_det_predecessors_);
+		replacer((*sparse_graph_it)->j_s_det_successors_, offline_guider_job->j_s_det_successors_);
+
+		replacer((*sparse_graph_it)->j_f_det_predecessors_, offline_guider_job->j_f_det_predecessors_);
+		replacer((*sparse_graph_it)->j_f_det_successors_, offline_guider_job->j_f_det_successors_);
+
+		replacer((*sparse_graph_it)->j_p_det_predecessors_, offline_guider_job->j_p_det_predecessors_);
+		replacer((*sparse_graph_it)->j_p_det_successors_, offline_guider_job->j_p_det_successors_);
+
+		//2nd HP 이므로 1st(from the view of sparse graph)로 만들어주려고 hp값 만큼 빼준다 
+		(*sparse_graph_it)->t_r_real_ -= hyper_period_;
+		(*sparse_graph_it)->min_t_s_real_ -= hyper_period_;
+		(*sparse_graph_it)->max_t_s_real_ -= hyper_period_;
+		(*sparse_graph_it)->min_t_f_real_ -= hyper_period_;
+		(*sparse_graph_it)->max_t_f_real_ -= hyper_period_;
+	}
 
 
+	AbstractedJob* virtual_start_job = new AbstractedJob("vs_sparse", NULL, 0ULL);
 
+	for (auto sparse_graph_it = sparse_graph_.begin(); sparse_graph_it != sparse_graph_.end(); ++sparse_graph_it)
+	{
+		std::uint64_t the_num_of_predecessors
+			= (*sparse_graph_it)->j_prev_det_predecessors_.size()
+			+ (*sparse_graph_it)->j_s_det_predecessors_.size()
+			+ (*sparse_graph_it)->j_f_det_predecessors_.size()
+			+ (*sparse_graph_it)->j_p_det_predecessors_.size();
 
+		if (the_num_of_predecessors == 0 || (*sparse_graph_it)->mapped_task_->physical_read_constraint_ == true)
+		{
+			if ((*sparse_graph_it)->mapped_task_->physical_read_constraint_ == true)
+				virtual_start_job->edge_weights_[(*sparse_graph_it)] = (*sparse_graph_it)->min_t_s_real_;
+			else
+				virtual_start_job->edge_weights_[(*sparse_graph_it)] = 0ULL;
+		}
+		
+		for (auto succ = (*sparse_graph_it)->j_prev_det_successors_.begin(); succ != (*sparse_graph_it)->j_prev_det_predecessors_.end(); ++succ)
+		{
+			auto w = (*sparse_graph_it)->edge_weights_.find(*succ);
+			if (w == (*sparse_graph_it)->edge_weights_.end())
+				(*sparse_graph_it)->edge_weights_[*succ] = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+			else if (w->second < (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_)
+				w->second = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+		}
+		for (auto succ = (*sparse_graph_it)->j_s_det_successors_.begin(); succ != (*sparse_graph_it)->j_s_det_predecessors_.end(); ++succ)
+		{
+			auto w = (*sparse_graph_it)->edge_weights_.find(*succ);
+			if (w == (*sparse_graph_it)->edge_weights_.end())
+				(*sparse_graph_it)->edge_weights_[*succ] = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+			else if (w->second < (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_)
+				w->second = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+		}
+		for (auto succ = (*sparse_graph_it)->j_f_det_successors_.begin(); succ != (*sparse_graph_it)->j_f_det_predecessors_.end(); ++succ)
+		{
+			auto w = (*sparse_graph_it)->edge_weights_.find(*succ);
+			if (w == (*sparse_graph_it)->edge_weights_.end())
+				(*sparse_graph_it)->edge_weights_[*succ] = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+			else if (w->second < (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_)
+				w->second = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+		}
+		for (auto succ = (*sparse_graph_it)->j_p_det_successors_.begin(); succ != (*sparse_graph_it)->j_p_det_predecessors_.end(); ++succ)
+		{
+			auto w = (*sparse_graph_it)->edge_weights_.find(*succ);
+			if (w == (*sparse_graph_it)->edge_weights_.end())
+				(*sparse_graph_it)->edge_weights_[*succ] = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+			else if (w->second < (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_)
+				w->second = (*sparse_graph_it)->mapped_task_->c_best_ / simulator_performance_ratio_;
+		}
+
+	}
+
+	return virtual_start_job;
 
 }
 
+/**
+  * @brief	Assign EPST for each job in sparse graph
+	*
+	* @param	Virtual start job
+	*/
+void AbstractedControlSystem::assign_epst(
+	AbstractedJob *virtual_start_job)
+{
+	std::vector<AbstractedJob*> stack;
+	std::map<AbstractedJob*, bool> visited;
+	
+	visited[virtual_start_job] = false;
+	for (auto sparse_graph_it = sparse_graph_.begin(); sparse_graph_it != sparse_graph_.end(); ++sparse_graph_it)
+		visited[*sparse_graph_it] = false;
+
+	topological_sort(virtual_start_job, stack, visited);
+
+	std::map<AbstractedJob*, std::uint64_t> dist;
+
+	dist[virtual_start_job] = 0ULL;
+	for (auto sparse_graph_it = sparse_graph_.begin(); sparse_graph_it != sparse_graph_.end(); ++sparse_graph_it)
+		dist[*sparse_graph_it] = std::numeric_limits<std::uint64_t>::min();
+	
+	for (auto job_it = stack.rbegin(); job_it != stack.rend(); ++job_it)
+	{
+		for (auto adj_job_it = (*job_it)->edge_weights_.begin(); adj_job_it != (*job_it)->edge_weights_.end(); ++adj_job_it)
+		{
+			if (dist[adj_job_it->first] <= dist[(*job_it)] + adj_job_it->second)
+				dist[adj_job_it->first] = dist[(*job_it)] + adj_job_it->second;
+		}
+	}
+
+	for (auto sparse_graph_it = sparse_graph_.begin(); sparse_graph_it != sparse_graph_.end(); ++sparse_graph_it)
+		(*sparse_graph_it)->epst_ = dist[(*sparse_graph_it)];
+}
+
+/**
+  * @brief	Initialize dense graph which ahs both D-edges and ND-edges and no cycle 
+	*
+	* @return Virtual start job
+	*/
+AbstractedJob* AbstractedControlSystem::initialize_dense_graph(void)
+{
+	// Deep copy the 2-HP's jobs
+	AbstractedJob* offline_guider_job = *get_offline_guider_job_by_name((*dense_graph_it)->name_);
+
+	auto replacer = [&](std::set<AbstractedJob*>& dense_graph_link, std::set<AbstractedJob*>& offline_guider_link)
+	{
+		dense_graph_link.clear();
+		for (auto offline_guider_it = offline_guider_link.begin(); offline_guider_it != offline_guider_link.end(); ++offline_guider_it)
+		{
+			if ((*offline_guider_it)->which_period_ == 1) // Only the links among the second HP should be copied
+				dense_graph_link.insert(*get_dense_graph_job_by_name((*offline_guider_it)->name_));
+		}
+	};
+
+	// Copy both of deterministic and non-deterministic edges
+	replacer((*dense_graph_it)->j_prev_det_predecessors_, offline_guider_job->j_prev_det_predecessors_);
+	replacer((*dense_graph_it)->j_prev_det_successors_, offline_guider_job->j_prev_det_successors_);
+
+	replacer((*dense_graph_it)->j_s_det_predecessors_, offline_guider_job->j_s_det_predecessors_);
+	replacer((*dense_graph_it)->j_s_det_successors_, offline_guider_job->j_s_det_successors_);
+	replacer((*dense_graph_it)->j_s_nodet_predecessors_, offline_guider_job->j_s_nodet_predecessors_);
+	replacer((*dense_graph_it)->j_s_nodet_successors_, offline_guider_job->j_s_nodet_successors_);
+
+	replacer((*dense_graph_it)->j_f_det_predecessors_, offline_guider_job->j_f_det_predecessors_);
+	replacer((*dense_graph_it)->j_f_det_successors_, offline_guider_job->j_f_det_successors_);
+	replacer((*dense_graph_it)->j_f_nodet_predecessors_, offline_guider_job->j_f_nodet_predecessors_);
+	replacer((*dense_graph_it)->j_f_nodet_successors_, offline_guider_job->j_f_nodet_successors_);
+
+	replacer((*dense_graph_it)->j_p_det_predecessors_, offline_guider_job->j_p_det_predecessors_);
+	replacer((*dense_graph_it)->j_p_det_successors_, offline_guider_job->j_p_det_successors_);
+	replacer((*dense_graph_it)->j_p_nodet_predecessors_, offline_guider_job->j_p_nodet_predecessors_);
+	replacer((*dense_graph_it)->j_p_nodet_successors_, offline_guider_job->j_p_nodet_successors_);
+
+	(*dense_graph_it)->t_r_real_ -= hyper_period_;
+	(*dense_graph_it)->min_t_s_real_ -= hyper_period_;
+	(*dense_graph_it)->max_t_s_real_ -= hyper_period_;
+	(*dense_graph_it)->min_t_f_real_ -= hyper_period_;
+	(*dense_graph_it)->max_t_f_real_ -= hyper_period_;
+
+	eliminate_cycles();
+
+	AbstractedJob* virtual_start_job = new AbstractedJob("vs_dense", NULL, 0ULL);
+
+	for (auto dense_graph_it = dense_graph_.begin(); dense_graph_it != dense_graph_.end(); ++dense_graph_it)
+	{
+		std::uint64_t the_num_of_predecessors
+			= (*dense_graph_it)->j_prev_det_predecessors_.size()
+			+ (*dense_graph_it)->j_s_det_predecessors_.size()
+			+ (*dense_graph_it)->j_s_nodet_predecessors_.size()
+			+ (*dense_graph_it)->j_f_det_predecessors_.size()
+			+ (*dense_graph_it)->j_f_nodet_predecessors_.size()
+			+ (*dense_graph_it)->j_p_det_predecessors_.size()
+			+ (*dense_graph_it)->j_p_nodet_predecessors_.size();
 
 
+		if (the_num_of_predecessors == 0 || (*dense_graph_it)->mapped_task_->physical_read_constraint_ == true)
+		{
+			if ((*dense_graph_it)->mapped_task_->physical_read_constraint_ == true)
+				virtual_start_job->edge_weights_[(*dense_graph_it)] = (*dense_graph_it)->max_t_s_real_ + (*dense_graph_it)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else
+				virtual_start_job->edge_weights_[(*dense_graph_it)] = (*dense_graph_it)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
 
+		for (auto succ = (*dense_graph_it)->j_prev_det_successors_.begin(); succ != (*dense_graph_it)->j_prev_det_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
 
+		for (auto succ = (*dense_graph_it)->j_s_det_successors_.begin(); succ != (*dense_graph_it)->j_s_det_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
 
+		for (auto succ = (*dense_graph_it)->j_s_nodet_successors_.begin(); succ != (*dense_graph_it)->j_s_nodet_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
 
+		for (auto succ = (*dense_graph_it)->j_f_det_successors_.begin(); succ != (*dense_graph_it)->j_f_det_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
+
+		for (auto succ = (*dense_graph_it)->j_f_nodet_successors_.begin(); succ != (*dense_graph_it)->j_f_nodet_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
+
+		for (auto succ = (*dense_graph_it)->j_p_det_successors_.begin(); succ != (*dense_graph_it)->j_p_det_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
+
+		for (auto succ = (*dense_graph_it)->j_p_nodet_successors_.begin(); succ != (*dense_graph_it)->j_p_nodet_successors_.end(); ++succ)
+		{
+			auto w = (*dense_graph_it)->edge_weights_.find(*succ);
+			if (w == (*dense_graph_it)->edge_weights_.end())
+				(*dense_graph_it)->edge_weights_[*succ] = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+			else if (w->second < (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_)
+				w->second = (*succ)->mapped_task_->c_worst_ / simulator_performance_ratio_;
+		}
+	}
+
+	return virtual_start_job;
+}
+
+/**
+  * @brief	Eliminate cycles on dense graph until no more cycle is detected
+	*/
+void AbstractedControlSystem::eliminate_cycles(void)
+{
+	while (true)
+	{
+		AbstractedJob *s;
+		std::vector<AbstractedJob*> stack;
+		std::map<AbstractedJob*, bool> visited;
+		
+		stack.clear();
+		
+		for (auto dense_job_it = dense_graph_.begin(); dense_job_it != dense_graph_.end(); ++dense_job_it)
+			visited[(*dense_job_it)] = false;
+		
+		for (auto dense_job_it = dense_graph_.begin(); dense_job_it != dense_graph_.end(); ++dense_job_it)
+		{
+			if (visited[*dense_job_it] == false && (s = dfs_dense_graph(*dense_job_it, stack, visited)) != NULL)
+				break;
+		}
+		
+		if (s == NULL)
+			break;
+		else
+		{
+			std::vector<AbstractedJob*>::iterator path_s = std::find(stack.begin(), stack.end(), s);
+			std::vector<AbstractedJob*>::iterator path_e = stack.end() - 1;
+
+			//non-deterministic edges
+			std::vector<std::pair<AbstractedJob*, AbstractedJob*> > nd_edges;
+			
+			for (auto path_it = path_s; path_it != path_e; ++path_it)
+			{
+				AbstractedJob *prev = *(path_it);
+				AbstractedJob *succ = *(path_it + 1);
+
+				if (prev->j_s_nodet_successors_.find(succ) != prev->j_s_nodet_predecessors_.end())
+					nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>(prev, succ));
+				if (prev->j_f_nodet_successors_.find(succ) != prev->j_f_nodet_predecessors_.end())
+					nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>(prev, succ));
+				if (prev->j_p_nodet_successors_.find(succ) != prev->j_p_nodet_predecessors_.end())
+					nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>(prev, succ));
+			}
+
+			if ((*path_e)->j_f_nodet_successors_.find((*path_s)) != (*path_e)->j_s_nodet_successors_.end())
+				nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>((*path_e), (*path_s)));
+			if ((*path_e)->j_f_nodet_successors_.find((*path_s)) != (*path_e)->j_s_nodet_successors_.end())
+				nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>((*path_e), (*path_s)));
+			if ((*path_e)->j_f_nodet_successors_.find((*path_s)) != (*path_e)->j_s_nodet_successors_.end())
+				nd_edges.push_back(std::pair<AbstractedJob*, AbstractedJob*>((*path_e), (*path_s)));
+
+			std::uint64_t max_diff = 0ULL;
+			AbstractedJob *max_diff_prev;
+			AbstractedJob *max_diff_succ;
+			for(auto edge_it = nd_edges.begin(); edge_it != nd_edges.end(); ++edge_it)
+			{
+				AbstractedJob *prev = edge_it->first;
+				AbstractedJob *succ = edge_it->second;
+
+				std::uint64_t diff = prev->max_t_s_real_ - succ->min_t_s_real_;
+				if (diff >= max_diff)
+				{
+					max_diff = diff;
+					max_diff_prev = prev;
+					max_diff_succ = succ;
+				}
+			}
+
+			max_diff_prev->j_s_nodet_successors_.erase(max_diff_succ);
+			max_diff_prev->j_f_nodet_successors_.erase(max_diff_succ);
+			max_diff_prev->j_p_nodet_successors_.erase(max_diff_succ);
+			max_diff_succ->j_s_nodet_predecessors_.erase(max_diff_prev);
+			max_diff_succ->j_f_nodet_predecessors_.erase(max_diff_prev);
+			max_diff_succ->j_p_nodet_predecessors_.erase(max_diff_prev);
+		}
+	}
+}
+
+/**
+  * @brief	Depth-First-Search on dense graph
+	*
+	*
+	* @param	root			root of DFS forest
+	* @param	stack			stack for tracing
+	* @param	visited		visited flags
+	*
+	* @return start job of detected cycle
+	*/
+AbstractedJob* AbstractedControlSystem::dfs_dense_graph(
+	AbstractedJob* root,
+	std::vector<AbstractedJob*>& stack,
+	std::map<AbstractedJob*, bool>& visited)
+{
+	visited[root] = true;
+	stack.push_back(root);
+
+	AbstractedJob *ret;
+
+	for (auto succ = root->j_prev_det_successors_.begin(); succ != root->j_prev_det_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_s_det_successors_.begin(); succ != root->j_s_det_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_s_nodet_successors_.begin(); succ != root->j_s_nodet_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_f_det_successors_.begin(); succ != root->j_f_det_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_f_nodet_successors_.begin(); succ != root->j_f_nodet_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_p_det_successors_.begin(); succ != root->j_p_det_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	for (auto succ = root->j_p_nodet_successors_.begin(); succ != root->j_p_nodet_predecessors_.end(); ++succ)
+	{
+		if (visited[*succ] == false && (ret = dfs_dense_graph(*succ, stack, visited)) != nullptr)
+			return ret; //sucessor인데, dfs간 결과 null값이 나오지 않는 경우 -> 잘 들어갔음 no cycle  
+		else if (std::find(stack.begin(), stack.end(), *succ) != stack.end()) //ret null 값인 경우, pop했기 때문에 successor가 stack안에 존재하지 않는 경우, return *succ
+			return *succ;
+	}
+
+	stack.pop_back();
+
+	return NULL;
+
+}
+
+/**
+  * @brief	Assign LPFT for each job in dense graph
+	*
+	* @param	Virtual Start job
+	*/
+void AbstractedControlSystem::assign_lpft(
+	AbstractedJob *virtual_start_job)
+{
+	std::vector<AbstractedJob*> stack;
+	std::map<AbstractedJob*, bool> visited;
+
+	visited[virtual_start_job] = false;
+	for (auto dense_graph_it = dense_graph_.begin(); dense_graph_it != dense_graph_.end(); ++dense_graph_it)
+		visited[*dense_graph_it] = false;
+
+	topological_sort(virtual_start_job, stack, visited);
+	
+	std::map<AbstractedJob*, std::uint64_t> dist;
+
+	dist[virtual_start_job] = 0ULL;
+	for (auto dense_graph_it = dense_graph_.begin(); dense_graph_it != dense_graph_.end(); ++dense_graph_it)
+		dist[*dense_graph_it] = std::numeric_limits<std::uint64_t>::min();
+
+	for (auto job_it = stack.rbegin(); job_it != stack.rend(); ++job_it)
+	{
+		for (auto adj_job_it = (*job_it)->edge_weights_.begin(); adj_job_it != (*job_it)->edge_weights_.end(); ++adj_job_it)
+		{
+			if (dist[adj_job_it->first] <= dist[(*job_it)] + adj_job_it->second)
+				dist[adj_job_it->first] = dist[(*job_it)] + adj_job_it->second;
+			
+		}
+	}
+
+	for (auto dense_graph_it = dense_graph_.begin(); dense_graph_it != dense_graph_.end(); ++dense_graph_it)
+		(*dense_graph_it)->lpft_ = dist[(*dense_graph_it)];
+}
 
 
 

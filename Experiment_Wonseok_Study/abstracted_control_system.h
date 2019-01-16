@@ -80,6 +80,11 @@ private:
 	void partition_producer_time_set(
 		AbstractedJob* job);
 
+	void topological_sort(
+		AbstractedJob *root,
+		std::vector<AbstractedJob*>& stack,
+		std::map<AbstractedJob*, bool>& visited);
+
 	AbstractedJob* initialize_sparse_graph(void);
 	void assign_epst(
 		AbstractedJob* virtual_start_job);
